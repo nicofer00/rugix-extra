@@ -1,0 +1,6 @@
+# Shared cloudflared defaults baked into the image.
+# Remotely-managed tunnels get their public hostname/ingress via the Cloudflare
+# API at provision time; this documents the intended origin service.
+ingress:
+  - service: __LOCAL_SERVICE__
+  - service: http_status:404

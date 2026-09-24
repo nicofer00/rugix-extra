@@ -1,0 +1,6 @@
+description = "install and configure Cloudflare Tunnel (cloudflared)"
+dependencies = ["core/pkg-update"]
+priority = 80_000
+
+[parameters]
+local_service = { default = "http://127.0.0.1:80" }

@@ -1,0 +1,14 @@
+[Unit]
+Description=Provision Cloudflare Tunnel for this device
+Documentation=https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/
+After=network-online.target
+Wants=network-online.target
+Before=cloudflared.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/cloudflared/cloudflared-provision.sh
+
+[Install]
+WantedBy=multi-user.target
