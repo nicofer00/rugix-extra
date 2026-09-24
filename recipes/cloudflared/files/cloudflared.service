@@ -1,0 +1,17 @@
+[Unit]
+Description=Cloudflare Tunnel
+Documentation=https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/
+After=network-online.target cloudflared-provision.service
+Wants=network-online.target
+Requires=cloudflared-provision.service
+ConditionPathExists=/var/lib/cloudflared/tunnel.token
+
+[Service]
+Type=notify
+TimeoutStartSec=0
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token-file /var/lib/cloudflared/tunnel.token
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
