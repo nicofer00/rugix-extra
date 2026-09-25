@@ -27,7 +27,15 @@ install -d -m 755 /usr/lib/cloudflared
 install -D -m 644 "${RECIPE_DIR}/files/cloudflared-state.toml" \
     /etc/rugix/state/cloudflared.toml
 
-sed "s|__LOCAL_SERVICE__|${RECIPE_PARAM_LOCAL_SERVICE}|g" \
+# pull configured domain for service, 00-run.sh already validated
+ENV_FILE="${RUGIX_PROJECT_DIR}/.env"
+if [ -e "${ENV_FILE}" ]; then
+    # shellcheck source=/dev/null
+    . "${ENV_FILE}"
+fi
+
+sed -e "s|__LOCAL_SERVICE__|${RECIPE_PARAM_LOCAL_SERVICE}|g" \
+    -e "s|__DOMAIN_WILDCARD__|\"*.${CLOUDFLARE_DOMAIN:-}\"|g" \
     "${RECIPE_DIR}/files/config.yaml" \
     > /etc/cloudflared/config.yaml
 chmod 644 /etc/cloudflared/config.yaml
