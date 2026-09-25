@@ -10,10 +10,15 @@
 # Per-device opt-in (/var/lib/cloudflared/device.env), set after flash:
 #   TUNNEL_SUBDOMAIN=my-device-01
 #
+# The public hostname is exactly one label under CLOUDFLARE_DOMAIN
+# (my-device-01.example.com). That matches Universal SSL (*.example.com).
+# A subdomain that already includes the zone or its first label is trimmed so
+# the request is not subdomain.example.example.com.
+#
 # If TUNNEL_SUBDOMAIN is missing or blank, this script exits without calling
 # Cloudflare (no tunnel). If tunnel.token already exists, creation is skipped.
 #
-# Recovery: if a tunnel named TUNNEL_SUBDOMAIN already exists (e.g. previous
+# Recovery: if a tunnel with this hostname label already exists (e.g. previous
 # device died), look it up by name, fetch its run token, and reuse it so the
 # new board can join the same public hostname.
 
@@ -68,8 +73,26 @@ fi
 : "${CLOUDFLARE_DOMAIN:?CLOUDFLARE_DOMAIN is required in ${ACCOUNT_ENV}}"
 
 LOCAL_SERVICE="${LOCAL_SERVICE:-http://127.0.0.1:80}"
-FQDN="${TUNNEL_SUBDOMAIN}.${CLOUDFLARE_DOMAIN}"
-TUNNEL_NAME="${TUNNEL_SUBDOMAIN}"
+
+# Universal SSL covers a single level (*.zone). Dashboard publishes
+# {subdomain}.{domain}; ingress hostname and DNS name must be that FQDN once.
+CLOUDFLARE_DOMAIN="${CLOUDFLARE_DOMAIN%.}"
+TUNNEL_SUBDOMAIN="${TUNNEL_SUBDOMAIN%.}"
+ZONE_LABEL="${CLOUDFLARE_DOMAIN%%.*}"
+if [[ "${TUNNEL_SUBDOMAIN}" == *".${CLOUDFLARE_DOMAIN}" ]]; then
+    TUNNEL_SUBDOMAIN="${TUNNEL_SUBDOMAIN%."${CLOUDFLARE_DOMAIN}"}"
+fi
+if [ -n "${ZONE_LABEL}" ] && [[ "${TUNNEL_SUBDOMAIN}" == *".${ZONE_LABEL}" ]]; then
+    TUNNEL_SUBDOMAIN="${TUNNEL_SUBDOMAIN%."${ZONE_LABEL}"}"
+fi
+TUNNEL_LABEL="${TUNNEL_SUBDOMAIN//./-}"
+if [ -z "${TUNNEL_LABEL}" ]; then
+    echo "cloudflared-provision: TUNNEL_SUBDOMAIN is empty after normalizing against ${CLOUDFLARE_DOMAIN}" >&2
+    exit 1
+fi
+FQDN="${TUNNEL_LABEL}.${CLOUDFLARE_DOMAIN}"
+TUNNEL_NAME="${TUNNEL_LABEL}"
+echo "cloudflared-provision: public hostname ${FQDN}"
 
 API="https://api.cloudflare.com/client/v4"
 AUTH_HEADER="Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
