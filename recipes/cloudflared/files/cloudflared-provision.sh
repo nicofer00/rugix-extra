@@ -11,12 +11,19 @@
 #   TUNNEL_SUBDOMAIN=my-device-01
 #
 # The public hostnames are one label under CLOUDFLARE_DOMAIN so they match
-# Universal SSL (*.example.com): my-device-01.example.com and, when SSH is
-# enabled, my-device-01-ssh.example.com. config.yaml is written here from
-# account.env, device.env, and defaults.env; it is not baked into the image.
+# Universal SSL (*.example.com): my-device-01.example.com, and when enabled
+# my-device-01-ssh.example.com and my-device-01-admin.example.com.
+# config.yaml is written here from account.env, device.env, and defaults.env.
+#
+# Optional Access policy names (defaults.env), empty means that hostname stays public:
+#   LOGIN_POLICY        reusable Allow policy for SSH and admin
+#   API_ACCESS_POLICY   reusable Service Auth policy for the API hostname
+# When either is set, CLOUDFLARE_API_TOKEN also needs Access: Apps and Policies
+# read and write.
 #
 # If TUNNEL_SUBDOMAIN is missing or blank, this script exits without calling
-# Cloudflare (no tunnel). An existing tunnel token still refreshes config and DNS.
+# Cloudflare (no tunnel). An existing tunnel token still refreshes config, DNS,
+# and Access apps.
 #
 # Recovery: if a tunnel with this hostname label already exists (e.g. previous
 # device died), look it up by name, fetch its run token, and reuse it so the
@@ -77,6 +84,9 @@ fi
 
 LOCAL_SERVICE="${LOCAL_SERVICE:-http://127.0.0.1:80}"
 SSH_ENABLE="${SSH_ENABLE:-true}"
+RUGIX_ADMIN_ENABLE="${RUGIX_ADMIN_ENABLE:-false}"
+LOGIN_POLICY="${LOGIN_POLICY:-}"
+API_ACCESS_POLICY="${API_ACCESS_POLICY:-}"
 
 # Universal SSL covers a single level (*.zone). Dashboard publishes
 # {subdomain}.{domain}; ingress hostname and DNS name must be that FQDN once.
@@ -96,6 +106,7 @@ if [ -z "${TUNNEL_LABEL}" ]; then
 fi
 FQDN="${TUNNEL_LABEL}.${CLOUDFLARE_DOMAIN}"
 SSH_FQDN="${TUNNEL_LABEL}-ssh.${CLOUDFLARE_DOMAIN}"
+ADMIN_FQDN="${TUNNEL_LABEL}-admin.${CLOUDFLARE_DOMAIN}"
 TUNNEL_NAME="${TUNNEL_LABEL}"
 echo "cloudflared-provision: public hostname ${FQDN}"
 
@@ -158,7 +169,7 @@ fetch_tunnel_token() {
 }
 
 write_config() {
-    local ssh_rule=""
+    local ssh_rule="" admin_rule=""
     if [ "${SSH_ENABLE}" = "true" ]; then
         ssh_rule="$(cat <<EOF
   - hostname: "${SSH_FQDN}"
@@ -166,10 +177,18 @@ write_config() {
 EOF
 )"
     fi
+    if [ "${RUGIX_ADMIN_ENABLE}" = "true" ]; then
+        admin_rule="$(cat <<EOF
+  - hostname: "${ADMIN_FQDN}"
+    service: "http://127.0.0.1:7492"
+EOF
+)"
+    fi
 
     cat > "${CONFIG_YAML}" <<EOF
 ingress:
 ${ssh_rule}
+${admin_rule}
   - hostname: "*.${CLOUDFLARE_DOMAIN}"
     service: "${LOCAL_SERVICE}"
   - service: "http_status:404"
@@ -233,6 +252,125 @@ publish_dns() {
     if [ "${SSH_ENABLE}" = "true" ]; then
         ensure_dns "${tunnel_id}" "${SSH_FQDN}"
     fi
+    if [ "${RUGIX_ADMIN_ENABLE}" = "true" ]; then
+        ensure_dns "${tunnel_id}" "${ADMIN_FQDN}"
+    fi
+}
+
+# Prints the reusable Access policy id for an exact name, or fails.
+find_policy_id() {
+    local name="$1"
+    local page=1 total id resp
+    while true; do
+        resp="$(cf_api GET \
+            "${API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/policies?page=${page}&per_page=100" \
+            "" \
+            0)"
+        if [ "$(echo "${resp}" | jq -r '.success')" != "true" ]; then
+            echo "cloudflared-provision: failed to list Access policies: ${resp}" >&2
+            return 1
+        fi
+        id="$(echo "${resp}" | jq -r --arg name "${name}" '
+            [.result[]? | select(.name == $name) | .id] | .[0] // empty
+        ')"
+        if [ -n "${id}" ]; then
+            printf '%s\n' "${id}"
+            return 0
+        fi
+        total="$(echo "${resp}" | jq -r '.result_info.total_pages // 1')"
+        if [ "${page}" -ge "${total}" ]; then
+            echo "cloudflared-provision: Access policy '${name}' was not found" >&2
+            return 1
+        fi
+        page=$((page + 1))
+    done
+}
+
+find_access_app_id() {
+    local hostname="$1"
+    local page=1 total id resp
+    while true; do
+        resp="$(cf_api GET \
+            "${API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps?page=${page}&per_page=100" \
+            "" \
+            0)"
+        if [ "$(echo "${resp}" | jq -r '.success')" != "true" ]; then
+            echo "cloudflared-provision: failed to list Access applications: ${resp}" >&2
+            return 1
+        fi
+        id="$(echo "${resp}" | jq -r --arg hostname "${hostname}" '
+            [.result[]? | select(.domain == $hostname) | .id] | .[0] // empty
+        ')"
+        if [ -n "${id}" ]; then
+            printf '%s\n' "${id}"
+            return 0
+        fi
+        total="$(echo "${resp}" | jq -r '.result_info.total_pages // 1')"
+        if [ "${page}" -ge "${total}" ]; then
+            return 0
+        fi
+        page=$((page + 1))
+    done
+}
+
+ensure_access_app() {
+    local hostname="$1"
+    local policy_id="$2"
+    local app_id payload resp
+    app_id="$(find_access_app_id "${hostname}")"
+    payload="$(jq -nc \
+        --arg name "${hostname}" \
+        --arg domain "${hostname}" \
+        --arg policy_id "${policy_id}" \
+        '{
+            name: $name,
+            domain: $domain,
+            type: "self_hosted",
+            session_duration: "24h",
+            policies: [{id: $policy_id, precedence: 1}]
+        }')"
+    if [ -n "${app_id}" ]; then
+        echo "cloudflared-provision: updating Access application for ${hostname}"
+        resp="$(cf_api PUT \
+            "${API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps/${app_id}" \
+            "${payload}" \
+            0)"
+    else
+        echo "cloudflared-provision: creating Access application for ${hostname}"
+        resp="$(cf_api POST \
+            "${API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps" \
+            "${payload}" \
+            0)"
+    fi
+    if [ "$(echo "${resp}" | jq -r '.success')" != "true" ]; then
+        echo "cloudflared-provision: failed to set Access application for ${hostname}: ${resp}" >&2
+        return 1
+    fi
+}
+
+# Resolve configured policy names before publishing so a missing policy fails
+# instead of leaving the hostname public.
+resolve_access_policies() {
+    API_POLICY_ID=""
+    LOGIN_POLICY_ID=""
+    if [ -n "${API_ACCESS_POLICY}" ]; then
+        API_POLICY_ID="$(find_policy_id "${API_ACCESS_POLICY}")"
+    fi
+    if [ -n "${LOGIN_POLICY}" ] && { [ "${SSH_ENABLE}" = "true" ] || [ "${RUGIX_ADMIN_ENABLE}" = "true" ]; }; then
+        LOGIN_POLICY_ID="$(find_policy_id "${LOGIN_POLICY}")"
+    fi
+}
+
+publish_access() {
+    if [ -n "${API_POLICY_ID}" ]; then
+        ensure_access_app "${FQDN}" "${API_POLICY_ID}"
+    fi
+    if [ "${SSH_ENABLE}" = "true" ] && [ -n "${LOGIN_POLICY_ID}" ]; then
+        ensure_access_app "${SSH_FQDN}" "${LOGIN_POLICY_ID}"
+    fi
+    if [ "${RUGIX_ADMIN_ENABLE}" = "true" ] && [ -n "${LOGIN_POLICY_ID}" ]; then
+        ensure_access_app "${ADMIN_FQDN}" "${LOGIN_POLICY_ID}"
+    fi
 }
 
 write_state() {
@@ -254,11 +392,14 @@ RECOVERED=0
 if [ "${HAVE_LOCAL_TUNNEL}" -eq 1 ]; then
     TUNNEL_ID="$(tr -d '[:space:]' < "${TUNNEL_ID_FILE}")"
     echo "cloudflared-provision: tunnel ${TUNNEL_ID} already exists; reuploading config"
+    resolve_access_policies
     ensure_ingress "${TUNNEL_ID}"
     publish_dns "${TUNNEL_ID}"
+    publish_access
     exit 0
 fi
 
+resolve_access_policies
 echo "cloudflared-provision: looking up tunnel '${TUNNEL_NAME}' for ${FQDN}"
 TUNNEL_ID="$(find_tunnel_id_by_name "${TUNNEL_NAME}")"
 
@@ -308,6 +449,7 @@ fi
 
 ensure_ingress "${TUNNEL_ID}"
 publish_dns "${TUNNEL_ID}"
+publish_access
 write_state "${TUNNEL_ID}" "${TUNNEL_TOKEN}"
 
 if [ "${RECOVERED}" -eq 1 ]; then

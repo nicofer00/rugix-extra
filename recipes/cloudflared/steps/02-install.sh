@@ -31,10 +31,13 @@ umask 077
 cat > /etc/cloudflared/defaults.env <<EOF
 LOCAL_SERVICE=${RECIPE_PARAM_LOCAL_SERVICE}
 SSH_ENABLE=${RECIPE_PARAM_SSH_ENABLE}
+RUGIX_ADMIN_ENABLE=${RECIPE_PARAM_RUGIX_ADMIN_ENABLE}
+LOGIN_POLICY=${RECIPE_PARAM_LOGIN_POLICY}
+API_ACCESS_POLICY=${RECIPE_PARAM_API_ACCESS_POLICY}
 EOF
 chmod 644 /etc/cloudflared/defaults.env
 
-# Ensure account.env exists even if 00-run.sh did not run (empty placeholders).
+# Ensure account.env exists even if 01-run.sh did not run (empty placeholders).
 if [ ! -f /etc/cloudflared/account.env ]; then
     umask 077
     cat > /etc/cloudflared/account.env <<EOF

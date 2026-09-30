@@ -5,6 +5,8 @@ set -euo pipefail
 # Inject Cloudflare account credentials from the consumer project .env into the
 # image. Expected variables:
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZONE_ID, CLOUDFLARE_DOMAIN
+# When login_policy or api_access_policy is set, the token also needs
+# Access: Apps and Policies read and write.
 # Missing .env still builds; devices cannot provision until account.env is populated.
 
 ENV_FILE="${RUGIX_PROJECT_DIR}/.env"

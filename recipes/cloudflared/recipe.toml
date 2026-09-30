@@ -4,4 +4,7 @@ priority = 80_000
 
 [parameters]
 local_service = { default = "http://127.0.0.1:80" }
-ssh_enable = { default = true }
+ssh_enable = { default = false }
+rugix_admin_enable = { default = false }
+login_policy = { default = "" }
+api_access_policy = { default = "" }
