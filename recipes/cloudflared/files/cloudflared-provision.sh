@@ -16,8 +16,10 @@
 # config.yaml is written here from account.env, device.env, and defaults.env.
 #
 # Optional Access policy names (defaults.env), empty means that hostname stays public:
-#   LOGIN_POLICY        reusable Allow policy for SSH and admin
-#   API_ACCESS_POLICY   reusable Service Auth policy for the API hostname
+#   LOGIN_POLICY        Allow policy for SSH and admin
+#   API_ACCESS_POLICY   Service Auth policy for the API hostname
+# Lookup checks policies on the Access application for CLOUDFLARE_DOMAIN
+# (or *.CLOUDFLARE_DOMAIN) first, then account reusable policies.
 # When either is set, CLOUDFLARE_API_TOKEN also needs Access: Apps and Policies
 # read and write.
 #
@@ -257,8 +259,68 @@ publish_dns() {
     fi
 }
 
-# Prints the reusable Access policy id for an exact name, or fails.
-find_policy_id() {
+# Prints the id of a policy named exactly $1 from a Cloudflare list response.
+policy_id_named() {
+    local name="$1"
+    local resp="$2"
+    echo "${resp}" | jq -r --arg name "${name}" '
+        [.result[]? | select(.name == $name) | .id] | .[0] // empty
+    '
+}
+
+# Policies attached to the Zero Trust application for this zone.
+# Matches the app whose domain is CLOUDFLARE_DOMAIN or *.CLOUDFLARE_DOMAIN.
+find_policy_id_on_zone_apps() {
+    local name="$1"
+    local page=1 total apps_resp app_id app_domain
+    local policy_page policy_total policies_resp id
+    while true; do
+        apps_resp="$(cf_api GET \
+            "${API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps?page=${page}&per_page=100" \
+            "" \
+            0)"
+        if [ "$(echo "${apps_resp}" | jq -r '.success')" != "true" ]; then
+            echo "cloudflared-provision: failed to list Access applications: ${apps_resp}" >&2
+            return 1
+        fi
+        while IFS=$'\t' read -r app_id app_domain; do
+            [ -n "${app_id}" ] || continue
+            case "${app_domain}" in
+                "${CLOUDFLARE_DOMAIN}"|"*.${CLOUDFLARE_DOMAIN}") ;;
+                *) continue ;;
+            esac
+            policy_page=1
+            while true; do
+                policies_resp="$(cf_api GET \
+                    "${API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps/${app_id}/policies?page=${policy_page}&per_page=100" \
+                    "" \
+                    0)"
+                if [ "$(echo "${policies_resp}" | jq -r '.success')" != "true" ]; then
+                    echo "cloudflared-provision: failed to list policies for ${app_domain}: ${policies_resp}" >&2
+                    return 1
+                fi
+                id="$(policy_id_named "${name}" "${policies_resp}")"
+                if [ -n "${id}" ]; then
+                    printf '%s\n' "${id}"
+                    return 0
+                fi
+                policy_total="$(echo "${policies_resp}" | jq -r '.result_info.total_pages // 1')"
+                if [ "${policy_page}" -ge "${policy_total}" ]; then
+                    break
+                fi
+                policy_page=$((policy_page + 1))
+            done
+        done < <(echo "${apps_resp}" | jq -r '.result[]? | [.id, .domain] | @tsv')
+        total="$(echo "${apps_resp}" | jq -r '.result_info.total_pages // 1')"
+        if [ "${page}" -ge "${total}" ]; then
+            return 0
+        fi
+        page=$((page + 1))
+    done
+}
+
+# Account-wide reusable policies. Used when the zone application has no match.
+find_account_policy_id() {
     local name="$1"
     local page=1 total id resp
     while true; do
@@ -270,20 +332,36 @@ find_policy_id() {
             echo "cloudflared-provision: failed to list Access policies: ${resp}" >&2
             return 1
         fi
-        id="$(echo "${resp}" | jq -r --arg name "${name}" '
-            [.result[]? | select(.name == $name) | .id] | .[0] // empty
-        ')"
+        id="$(policy_id_named "${name}" "${resp}")"
         if [ -n "${id}" ]; then
             printf '%s\n' "${id}"
             return 0
         fi
         total="$(echo "${resp}" | jq -r '.result_info.total_pages // 1')"
         if [ "${page}" -ge "${total}" ]; then
-            echo "cloudflared-provision: Access policy '${name}' was not found" >&2
-            return 1
+            return 0
         fi
         page=$((page + 1))
     done
+}
+
+# Prints the Access policy id for an exact name, or fails.
+# Application policies on the zone app come first; account reusable policies are the fallback.
+find_policy_id() {
+    local name="$1"
+    local id
+    id="$(find_policy_id_on_zone_apps "${name}")" || return 1
+    if [ -n "${id}" ]; then
+        printf '%s\n' "${id}"
+        return 0
+    fi
+    id="$(find_account_policy_id "${name}")" || return 1
+    if [ -n "${id}" ]; then
+        printf '%s\n' "${id}"
+        return 0
+    fi
+    echo "cloudflared-provision: Access policy '${name}' was not found" >&2
+    return 1
 }
 
 find_access_app_id() {
