@@ -10,13 +10,13 @@
 # Per-device opt-in (/var/lib/cloudflared/device.env), set after flash:
 #   TUNNEL_SUBDOMAIN=my-device-01
 #
-# The public hostname is exactly one label under CLOUDFLARE_DOMAIN
-# (my-device-01.example.com). That matches Universal SSL (*.example.com).
-# A subdomain that already includes the zone or its first label is trimmed so
-# the request is not subdomain.example.example.com.
+# The public hostnames are one label under CLOUDFLARE_DOMAIN so they match
+# Universal SSL (*.example.com): my-device-01.example.com and, when SSH is
+# enabled, my-device-01-ssh.example.com. config.yaml is written here from
+# account.env, device.env, and defaults.env; it is not baked into the image.
 #
 # If TUNNEL_SUBDOMAIN is missing or blank, this script exits without calling
-# Cloudflare (no tunnel). If tunnel.token already exists, creation is skipped.
+# Cloudflare (no tunnel). An existing tunnel token still refreshes config and DNS.
 #
 # Recovery: if a tunnel with this hostname label already exists (e.g. previous
 # device died), look it up by name, fetch its run token, and reuse it so the
@@ -31,6 +31,7 @@ TOKEN_FILE="/var/lib/cloudflared/tunnel.token"
 TUNNEL_ID_FILE="/var/lib/cloudflared/tunnel.id"
 HOSTNAME_FILE="/var/lib/cloudflared/hostname"
 STATE_DIR="/var/lib/cloudflared"
+CONFIG_YAML="/etc/cloudflared/config.yaml"
 
 mkdir -p "${STATE_DIR}"
 chmod 700 "${STATE_DIR}"
@@ -62,9 +63,11 @@ if [ -z "${TUNNEL_SUBDOMAIN}" ]; then
     exit 0
 fi
 
-if [ -s "${TOKEN_FILE}" ]; then
-    echo "cloudflared-provision: tunnel token already present; skipping creation"
-    exit 0
+# A local token means the tunnel was already created. Still refresh config.yaml
+# and DNS from the current settings.
+HAVE_LOCAL_TUNNEL=0
+if [ -s "${TOKEN_FILE}" ] && [ -s "${TUNNEL_ID_FILE}" ]; then
+    HAVE_LOCAL_TUNNEL=1
 fi
 
 : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required in ${ACCOUNT_ENV}}"
@@ -73,6 +76,7 @@ fi
 : "${CLOUDFLARE_DOMAIN:?CLOUDFLARE_DOMAIN is required in ${ACCOUNT_ENV}}"
 
 LOCAL_SERVICE="${LOCAL_SERVICE:-http://127.0.0.1:80}"
+SSH_ENABLE="${SSH_ENABLE:-true}"
 
 # Universal SSL covers a single level (*.zone). Dashboard publishes
 # {subdomain}.{domain}; ingress hostname and DNS name must be that FQDN once.
@@ -91,6 +95,7 @@ if [ -z "${TUNNEL_LABEL}" ]; then
     exit 1
 fi
 FQDN="${TUNNEL_LABEL}.${CLOUDFLARE_DOMAIN}"
+SSH_FQDN="${TUNNEL_LABEL}-ssh.${CLOUDFLARE_DOMAIN}"
 TUNNEL_NAME="${TUNNEL_LABEL}"
 echo "cloudflared-provision: public hostname ${FQDN}"
 
@@ -152,24 +157,39 @@ fetch_tunnel_token() {
     printf '%s\n' "${token}"
 }
 
+write_config() {
+    local ssh_rule=""
+    if [ "${SSH_ENABLE}" = "true" ]; then
+        ssh_rule="$(cat <<EOF
+  - hostname: "${SSH_FQDN}"
+    service: "ssh://127.0.0.1:22"
+EOF
+)"
+    fi
+
+    cat > "${CONFIG_YAML}" <<EOF
+ingress:
+${ssh_rule}
+  - hostname: "*.${CLOUDFLARE_DOMAIN}"
+    service: "${LOCAL_SERVICE}"
+  - service: "http_status:404"
+EOF
+    chmod 644 "${CONFIG_YAML}"
+}
+
 ensure_ingress() {
     local tunnel_id="$1"
     local config_payload config_resp
-    config_payload="$(jq -nc \
-        --arg hostname "${FQDN}" \
-        --arg service "${LOCAL_SERVICE}" \
-        '{
-            config: {
-                ingress: [
-                    {hostname: $hostname, service: $service, originRequest: {}},
-                    {service: "http_status:404"}
-                ]
-            }
-        }')"
 
+    write_config
+    # Debian yq (jq wrapper) wraps the generated document as the tunnel config.
+    config_payload="$(yq -c '{config: .}' "${CONFIG_YAML}")"
+
+    echo "cloudflared-provision: uploading ${CONFIG_YAML} to tunnel ${tunnel_id}"
     config_resp="$(cf_api PUT \
         "${API}/accounts/${CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel/${tunnel_id}/configurations" \
-        "${config_payload}")"
+        "${config_payload}" \
+        0)"
 
     if [ "$(echo "${config_resp}" | jq -r '.success')" != "true" ]; then
         echo "cloudflared-provision: failed to configure tunnel ingress: ${config_resp}" >&2
@@ -179,9 +199,10 @@ ensure_ingress() {
 
 ensure_dns() {
     local tunnel_id="$1"
+    local hostname="$2"
     local dns_payload dns_resp error_code
     dns_payload="$(jq -nc \
-        --arg name "${FQDN}" \
+        --arg name "${hostname}" \
         --arg content "${tunnel_id}.cfargotunnel.com" \
         '{type: "CNAME", proxied: true, name: $name, content: $content}')"
 
@@ -198,12 +219,20 @@ ensure_dns() {
     error_code="$(echo "${dns_resp}" | jq -r '.errors[0].code // empty')"
     # 81053 / 81057: record already exists for this hostname.
     if [ "${error_code}" = "81057" ] || [ "${error_code}" = "81053" ]; then
-        echo "cloudflared-provision: DNS record already exists; continuing"
+        echo "cloudflared-provision: DNS record already exists for ${hostname}; continuing"
         return 0
     fi
 
-    echo "cloudflared-provision: failed to create DNS record: ${dns_resp}" >&2
+    echo "cloudflared-provision: failed to create DNS record for ${hostname}: ${dns_resp}" >&2
     return 1
+}
+
+publish_dns() {
+    local tunnel_id="$1"
+    ensure_dns "${tunnel_id}" "${FQDN}"
+    if [ "${SSH_ENABLE}" = "true" ]; then
+        ensure_dns "${tunnel_id}" "${SSH_FQDN}"
+    fi
 }
 
 write_state() {
@@ -221,6 +250,14 @@ write_state() {
 TUNNEL_ID=""
 TUNNEL_TOKEN=""
 RECOVERED=0
+
+if [ "${HAVE_LOCAL_TUNNEL}" -eq 1 ]; then
+    TUNNEL_ID="$(tr -d '[:space:]' < "${TUNNEL_ID_FILE}")"
+    echo "cloudflared-provision: tunnel ${TUNNEL_ID} already exists; reuploading config"
+    ensure_ingress "${TUNNEL_ID}"
+    publish_dns "${TUNNEL_ID}"
+    exit 0
+fi
 
 echo "cloudflared-provision: looking up tunnel '${TUNNEL_NAME}' for ${FQDN}"
 TUNNEL_ID="$(find_tunnel_id_by_name "${TUNNEL_NAME}")"
@@ -270,7 +307,7 @@ if [ -z "${TUNNEL_TOKEN}" ] || [ "${TUNNEL_TOKEN}" = "null" ]; then
 fi
 
 ensure_ingress "${TUNNEL_ID}"
-ensure_dns "${TUNNEL_ID}"
+publish_dns "${TUNNEL_ID}"
 write_state "${TUNNEL_ID}" "${TUNNEL_TOKEN}"
 
 if [ "${RECOVERED}" -eq 1 ]; then
