@@ -52,7 +52,7 @@ fi
 
 install -D -m 755 "${RECIPE_DIR}/files/cloudflared-provision.sh" \
     -t /usr/lib/cloudflared/
-install -D -m 755 "${RECIPE_DIR}/files/cloudflared-refresh.sh" \
+install -D -m 755 "${RECIPE_DIR}/files/cloudflared-select-protocol.sh" \
     -t /usr/lib/cloudflared/
 
 install -D -m 644 "${RECIPE_DIR}/files/cloudflared-provision.service" \

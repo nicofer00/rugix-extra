@@ -1,3 +1,13 @@
+# Long-running tunnel connector. Type=notify so dependents After= this unit
+# wait until cloudflared has an edge connection (READY=1), including QUIC→HTTP/2
+# fallback when TimeoutStartSec=0. Separate from provision so connector restarts
+# do not re-call the Cloudflare API; use cloudflared-refresh.service when
+# device.env / TUNNEL_SUBDOMAIN may have changed.
+#
+# ExecStartPre probes UDP/TCP 7844 and writes PROTOCOL to /run (tmpfs) so each
+# start can skip slow QUIC backoff when UDP is blocked, then re-prefer quic
+# when the probe succeeds again. EnvironmentFile is not used: systemd reads it
+# before ExecStartPre, so ExecStart sources the file after the probe writes it.
 [Unit]
 Description=Cloudflare Tunnel
 Documentation=https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/
@@ -9,9 +19,8 @@ Requires=cloudflared-provision.service
 Type=notify
 TimeoutStartSec=0
 ExecCondition=/usr/bin/test -e /var/lib/cloudflared/tunnel.token
-ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token-file /var/lib/cloudflared/tunnel.token
-# block systemd from starting middleware until tunnel is fully up, IF there is a tunnel.token
-ExecStartPost=/usr/bin/bash -c 'for port in {20241..20245}; do curl -sf --connect-timeout 1 "http://127.0.0.1:$port/ready" && exit 0; done; exit 1'
+ExecStartPre=/usr/lib/cloudflared/cloudflared-select-protocol.sh
+ExecStart=/bin/sh -c 'set -a; . /run/cloudflared/protocol.env; set +a; exec /usr/bin/cloudflared tunnel --no-autoupdate --protocol "${PROTOCOL}" run --token-file /var/lib/cloudflared/tunnel.token'
 Restart=on-failure
 RestartSec=5s
 

@@ -1,3 +1,9 @@
+# On-demand refresh API for refresh_after drop-ins and operators:
+#   systemctl start cloudflared-refresh.service
+# Stops the connector, re-runs provision (re-reads device.env), then starts
+# cloudflared only if a tunnel token exists. Kept separate from the provision
+# oneshot so boot does not run this path, and from cloudflared.service so
+# connector-only restarts do not re-hit the Cloudflare API.
 [Unit]
 Description=Refresh Cloudflare Tunnel provisioning and connector
 Documentation=https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/
@@ -6,4 +12,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/lib/cloudflared/cloudflared-refresh.sh
+# Best-effort: inactive cloudflared must not fail the refresh.
+ExecStart=-/bin/systemctl stop cloudflared.service
+ExecStart=/bin/systemctl restart cloudflared-provision.service
+ExecStart=/bin/sh -c 'if [ -s /var/lib/cloudflared/tunnel.token ]; then exec /bin/systemctl start cloudflared.service; fi'
