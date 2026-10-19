@@ -4,12 +4,14 @@ Documentation=https://developers.cloudflare.com/cloudflare-one/networks/connecto
 After=network-online.target cloudflared-provision.service
 Wants=network-online.target
 Requires=cloudflared-provision.service
-ConditionPathExists=/var/lib/cloudflared/tunnel.token
 
 [Service]
 Type=notify
 TimeoutStartSec=0
+ExecCondition=/usr/bin/test -e /var/lib/cloudflared/tunnel.token
 ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token-file /var/lib/cloudflared/tunnel.token
+# block systemd from starting middleware until tunnel is fully up, IF there is a tunnel.token
+ExecStartPost=/usr/bin/bash -c 'for port in {20241..20245}; do curl -sf --connect-timeout 1 "http://127.0.0.1:$port/ready" && exit 0; done; exit 1'
 Restart=on-failure
 RestartSec=5s
 
