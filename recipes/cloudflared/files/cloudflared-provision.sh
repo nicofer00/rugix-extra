@@ -23,13 +23,23 @@
 # When either is set, CLOUDFLARE_API_TOKEN also needs Access: Apps and Policies
 # read and write.
 #
-# If TUNNEL_SUBDOMAIN is missing or blank, this script exits without calling
-# Cloudflare (no tunnel). An existing tunnel token still refreshes config, DNS,
-# and Access apps.
+# If TUNNEL_SUBDOMAIN is missing or blank, this script clears local tunnel state
+# (if any) and exits without calling Cloudflare. With a matching stored
+# hostname, an existing token still refreshes config, DNS, and Access apps.
+#
+# If TUNNEL_SUBDOMAIN changes (hostname file != new FQDN), local token/id are
+# cleared and the script creates or recovers the tunnel for the new name.
+# Previous DNS/Access records for the old FQDN are left in place.
 #
 # Recovery: if a tunnel with this hostname label already exists (e.g. previous
 # device died), look it up by name, fetch its run token, and reuse it so the
 # new board can join the same public hostname.
+#
+# defaults.env USE_FEDRAMP=true uses *.fed-cfargotunnel.com CNAME targets
+# (FedRAMP High); otherwise *.cfargotunnel.com.
+#
+# To re-run after another unit updates device.env:
+#   systemctl start cloudflared-refresh.service
 
 set -euo pipefail
 
@@ -68,12 +78,19 @@ fi
 
 TUNNEL_SUBDOMAIN="${TUNNEL_SUBDOMAIN:-}"
 if [ -z "${TUNNEL_SUBDOMAIN}" ]; then
-    echo "cloudflared-provision: TUNNEL_SUBDOMAIN not set; skipping tunnel creation"
+    # Opt-out: drop local connector state so cloudflared-refresh leaves the
+    # tunnel stopped instead of reconnecting the previous subdomain.
+    if [ -e "${TOKEN_FILE}" ] || [ -e "${TUNNEL_ID_FILE}" ] || [ -e "${HOSTNAME_FILE}" ]; then
+        echo "cloudflared-provision: TUNNEL_SUBDOMAIN not set; clearing local tunnel state"
+        rm -f "${TOKEN_FILE}" "${TUNNEL_ID_FILE}" "${HOSTNAME_FILE}"
+    else
+        echo "cloudflared-provision: TUNNEL_SUBDOMAIN not set; skipping tunnel creation"
+    fi
     exit 0
 fi
 
 # A local token means the tunnel was already created. Still refresh config.yaml
-# and DNS from the current settings.
+# and DNS from the current settings when the hostname still matches.
 HAVE_LOCAL_TUNNEL=0
 if [ -s "${TOKEN_FILE}" ] && [ -s "${TUNNEL_ID_FILE}" ]; then
     HAVE_LOCAL_TUNNEL=1
@@ -89,6 +106,12 @@ SSH_ENABLE="${SSH_ENABLE:-true}"
 RUGIX_ADMIN_ENABLE="${RUGIX_ADMIN_ENABLE:-false}"
 LOGIN_POLICY="${LOGIN_POLICY:-}"
 API_ACCESS_POLICY="${API_ACCESS_POLICY:-}"
+USE_FEDRAMP="${USE_FEDRAMP:-false}"
+if [ "${USE_FEDRAMP}" = "true" ]; then
+    TUNNEL_DNS_SUFFIX="fed-cfargotunnel.com"
+else
+    TUNNEL_DNS_SUFFIX="cfargotunnel.com"
+fi
 
 # Universal SSL covers a single level (*.zone). Dashboard publishes
 # {subdomain}.{domain}; ingress hostname and DNS name must be that FQDN once.
@@ -111,6 +134,16 @@ SSH_FQDN="${TUNNEL_LABEL}-ssh.${CLOUDFLARE_DOMAIN}"
 ADMIN_FQDN="${TUNNEL_LABEL}-admin.${CLOUDFLARE_DOMAIN}"
 TUNNEL_NAME="${TUNNEL_LABEL}"
 echo "cloudflared-provision: public hostname ${FQDN}"
+
+# Subdomain changed: drop local connector state so we create/recover the new tunnel.
+if [ "${HAVE_LOCAL_TUNNEL}" -eq 1 ] && [ -s "${HOSTNAME_FILE}" ]; then
+    STORED_FQDN="$(tr -d '[:space:]' < "${HOSTNAME_FILE}")"
+    if [ "${STORED_FQDN}" != "${FQDN}" ]; then
+        echo "cloudflared-provision: hostname changed (${STORED_FQDN} -> ${FQDN}); clearing local tunnel state"
+        rm -f "${TOKEN_FILE}" "${TUNNEL_ID_FILE}"
+        HAVE_LOCAL_TUNNEL=0
+    fi
+fi
 
 API="https://api.cloudflare.com/client/v4"
 AUTH_HEADER="Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
@@ -191,7 +224,7 @@ EOF
 ingress:
 ${ssh_rule}
 ${admin_rule}
-  - hostname: "*.${CLOUDFLARE_DOMAIN}"
+  - hostname: "${FQDN}"
     service: "${LOCAL_SERVICE}"
   - service: "http_status:404"
 EOF
@@ -218,13 +251,19 @@ ensure_ingress() {
     fi
 }
 
+# Create or reconcile a proxied CNAME to ${tunnel_id}.${TUNNEL_DNS_SUFFIX}.
+# On 81053/81057 (record exists), GET the existing record and PUT if content or
+# proxied flag drift — silent "already exists" leaves 530/1033 when the UUID is wrong.
 ensure_dns() {
     local tunnel_id="$1"
     local hostname="$2"
+    local expected_content="${tunnel_id}.${TUNNEL_DNS_SUFFIX}"
     local dns_payload dns_resp error_code
+    local encoded list_resp record_id current_content current_proxied update_payload update_resp
+
     dns_payload="$(jq -nc \
         --arg name "${hostname}" \
-        --arg content "${tunnel_id}.cfargotunnel.com" \
+        --arg content "${expected_content}" \
         '{type: "CNAME", proxied: true, name: $name, content: $content}')"
 
     # Do not fail on HTTP errors — existing CNAME is expected on recovery.
@@ -234,18 +273,64 @@ ensure_dns() {
         0)"
 
     if [ "$(echo "${dns_resp}" | jq -r '.success')" = "true" ]; then
+        echo "cloudflared-provision: created DNS CNAME ${hostname} -> ${expected_content}"
         return 0
     fi
 
     error_code="$(echo "${dns_resp}" | jq -r '.errors[0].code // empty')"
-    # 81053 / 81057: record already exists for this hostname.
-    if [ "${error_code}" = "81057" ] || [ "${error_code}" = "81053" ]; then
-        echo "cloudflared-provision: DNS record already exists for ${hostname}; continuing"
+    # 81053 / 81057: record already exists for this hostname — reconcile.
+    if [ "${error_code}" != "81057" ] && [ "${error_code}" != "81053" ]; then
+        echo "cloudflared-provision: failed to create DNS record for ${hostname}: ${dns_resp}" >&2
+        return 1
+    fi
+
+    encoded="$(jq -nr --arg n "${hostname}" '$n | @uri')"
+    list_resp="$(cf_api GET \
+        "${API}/zones/${CLOUDFLARE_ZONE_ID}/dns_records?type=CNAME&name=${encoded}" \
+        "" \
+        0)"
+
+    if [ "$(echo "${list_resp}" | jq -r '.success')" != "true" ]; then
+        echo "cloudflared-provision: failed to look up DNS record for ${hostname}: ${list_resp}" >&2
+        return 1
+    fi
+
+    record_id="$(echo "${list_resp}" | jq -r '
+        [.result[]? | select(.type == "CNAME") | .id] | .[0] // empty
+    ')"
+    if [ -z "${record_id}" ]; then
+        echo "cloudflared-provision: DNS conflict for ${hostname} but no CNAME found to update: ${list_resp}" >&2
+        return 1
+    fi
+
+    current_content="$(echo "${list_resp}" | jq -r --arg id "${record_id}" '
+        [.result[]? | select(.id == $id) | .content] | .[0] // empty
+    ')"
+    current_proxied="$(echo "${list_resp}" | jq -r --arg id "${record_id}" '
+        [.result[]? | select(.id == $id) | .proxied] | .[0] // false
+    ')"
+
+    # Compare content case-insensitively; require proxied=true.
+    if [ "$(printf '%s' "${current_content}" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "${expected_content}" | tr '[:upper:]' '[:lower:]')" ] \
+        && [ "${current_proxied}" = "true" ]; then
+        echo "cloudflared-provision: DNS CNAME ${hostname} already points at ${expected_content}"
         return 0
     fi
 
-    echo "cloudflared-provision: failed to create DNS record for ${hostname}: ${dns_resp}" >&2
-    return 1
+    echo "cloudflared-provision: updating DNS CNAME ${hostname}: ${current_content} (proxied=${current_proxied}) -> ${expected_content} (proxied=true)"
+    update_payload="$(jq -nc \
+        --arg name "${hostname}" \
+        --arg content "${expected_content}" \
+        '{type: "CNAME", proxied: true, name: $name, content: $content}')"
+    update_resp="$(cf_api PUT \
+        "${API}/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${record_id}" \
+        "${update_payload}" \
+        0)"
+
+    if [ "$(echo "${update_resp}" | jq -r '.success')" != "true" ]; then
+        echo "cloudflared-provision: failed to update DNS record for ${hostname}: ${update_resp}" >&2
+        return 1
+    fi
 }
 
 publish_dns() {

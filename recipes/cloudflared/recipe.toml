@@ -8,3 +8,9 @@ ssh_enable = { default = false }
 rugix_admin_enable = { default = false }
 login_policy = { default = "" }
 api_access_policy = { default = "" }
+# When true, DNS CNAMEs use <tunnel-id>.fed-cfargotunnel.com (FedRAMP High).
+use_fedramp = { default = false }
+# Space- or comma-separated systemd unit names. Each gets an ExecStartPost
+# drop-in that starts cloudflared-refresh.service (--no-block). Upstream should
+# write /var/lib/cloudflared/device.env before it finishes start.
+refresh_after = { default = "" }
