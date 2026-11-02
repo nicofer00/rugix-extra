@@ -1,0 +1,28 @@
+description = "generate systemd dependency diagrams with Graphviz"
+dependencies = ["core/pkg-update"]
+# Run late so the bake-time unit inventory sees other recipes' enables.
+priority = -100_000
+
+[parameters]
+# On-device output directory for .dot / .svg
+output_dir = { default = "/var/lib/systemd-diagrams" }
+
+# systemd-analyze filters (space-separated globs); empty = manager defaults
+unit_patterns = { default = "" }
+from_pattern = { default = "" }
+to_pattern = { default = "" }
+# "both" | "order" | "require"
+dependency_mode = { default = "both" }
+
+# Also emit systemd-analyze plot boot SVG when true
+include_boot_plot = { default = true }
+
+# Regenerate after boot (oneshot WantedBy=multi-user.target)
+enable_oneshot = { default = true }
+
+# When true, publish under nginx docroot (requires nginx recipe / package present)
+publish_nginx = { default = false }
+nginx_docroot = { default = "/var/www/html/systemd" }
+
+# Build-time inventory artifact name under RUGIX_ARTIFACTS_DIR
+inventory_file = { default = "systemd-unit-inventory.txt" }

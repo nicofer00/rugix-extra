@@ -1,0 +1,13 @@
+[Unit]
+Description=Generate systemd dependency diagrams
+Documentation=man:systemd-analyze(1)
+After=multi-user.target
+ConditionPathExists=/usr/lib/systemd-diagrams/systemd-diagrams-generate.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/systemd-diagrams/systemd-diagrams-generate.sh
+
+[Install]
+WantedBy=multi-user.target

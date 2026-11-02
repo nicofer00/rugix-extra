@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Systemd diagrams</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --fg: #1a1a1a;
+      --bg: #f6f6f6;
+      --muted: #555;
+      --border: #ccc;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --fg: #f0f0f0;
+        --bg: #121212;
+        --muted: #aaa;
+        --border: #333;
+      }
+    }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.4;
+    }
+    header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+    h1 {
+      margin: 0 0 0.25rem;
+      font-size: 1.25rem;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    nav {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      padding: 0.75rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+    nav a {
+      color: inherit;
+    }
+    main {
+      padding: 1rem 1.25rem 2rem;
+      overflow: auto;
+    }
+    img {
+      max-width: 100%;
+      height: auto;
+      background: #fff;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Systemd diagrams</h1>
+    <p>Generated on-device with <code>systemd-analyze</code> and Graphviz.</p>
+  </header>
+  <nav>
+    <a href="dependencies.svg">Dependencies (SVG)</a>
+    <a href="dependencies.dot">Dependencies (DOT)</a>
+    <a href="boot.svg">Boot plot</a>
+  </nav>
+  <main>
+    <h2>Dependencies</h2>
+    <img src="dependencies.svg" alt="Systemd dependency graph">
+    <h2>Boot plot</h2>
+    <img src="boot.svg" alt="Systemd boot plot">
+  </main>
+</body>
+</html>
